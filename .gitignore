@@ -5,7 +5,7 @@
 .env
 
 # Google credentials
-/config/google-credentials.json
+./google-credentials.json
 
 # misc
 .DS_Store
