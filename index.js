@@ -35,44 +35,114 @@ const openai = new OpenAI({
 });
 
 // Initialize Google Sheets Authentication
-const serviceAccount = {
-  type: "service_account",
-  project_id: process.env.GOOGLE_PROJECT_ID,
-  private_key_id: process.env.GOOGLE_PRIVATE_KEY_ID,
-  private_key: process.env.GOOGLE_PRIVATE_KEY,
-  client_email: process.env.GOOGLE_CLIENT_EMAIL,
-  client_id: process.env.GOOGLE_CLIENT_ID,
-  auth_uri: process.env.GOOGLE_AUTH_URI,
-  token_uri: process.env.GOOGLE_TOKEN_URI,
-  auth_provider_x509_cert_url: process.env.GOOGLE_AUTH_PROVIDER_X509_CERT_URL,
-  client_x509_cert_url: process.env.GOOGLE_CLIENT_X509_CERT_URL
-};
+const credentials = JSON.parse(readFileSync('./google-credentials.json'));
+const serviceAccountAuth = new JWT({
+    email: credentials.client_email,
+    key: credentials.private_key,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+});
 
 async function getSheetData(spreadsheetId) {
-    const doc = new GoogleSpreadsheet(spreadsheetId, serviceAccountAuth);
-    await doc.loadInfo();
-    
-    const sheetData = {};
-    for (let i = 0; i < doc.sheetCount; i++) {
-        const sheet = doc.sheetsByIndex[i];
-        await sheet.loadCells();
-        const rows = await sheet.getRows();
-        sheetData[sheet.title] = {
-            title: sheet.title,
-            headers: rows[0] ? Object.keys(rows[0]).filter(key => !key.startsWith('_')) : [],
-            rows: rows.map(row => {
-                const rowData = {};
-                Object.keys(row).filter(key => !key.startsWith('_')).forEach(key => {
-                    rowData[key] = row[key];
-                });
-                return rowData;
-            })
-        };
+    try {
+        const doc = new GoogleSpreadsheet(spreadsheetId, serviceAccountAuth);
+        await doc.loadInfo();
+        console.log(`Accessed document: ${doc.title}`);
+        
+        const sheetData = {};
+        for (let i = 0; i < doc.sheetCount; i++) {
+            const sheet = doc.sheetsByIndex[i];
+            console.log(`Processing sheet: ${sheet.title}`);
+            
+            // Load all cells in the sheet
+            await sheet.loadCells();
+            
+            // Get sheet dimensions
+            const rowCount = sheet.rowCount;
+            const columnCount = sheet.columnCount;
+            
+            // Initialize data structure for this sheet
+            const rows = [];
+            
+            // Iterate through all cells and get their values
+            for (let row = 0; row < rowCount; row++) {
+                const rowData = [];
+                for (let col = 0; col < columnCount; col++) {
+                    const cell = sheet.getCell(row, col);
+                    // Get the formatted value or raw value
+                    rowData.push(cell.formattedValue || cell.value || '');
+                }
+                // Only add rows that have at least one non-empty cell
+                if (rowData.some(cell => cell !== '')) {
+                    rows.push(rowData);
+                }
+            }
+
+            sheetData[sheet.title] = {
+                title: sheet.title,
+                data: rows,
+                rowCount: rowCount,
+                columnCount: columnCount
+            };
+        }
+        return sheetData;
+    } catch (error) {
+        console.error('Error accessing sheet:', error);
+        throw new Error(`Failed to access sheet: ${error.message}`);
     }
-    return sheetData;
 }
 
-// WebSocket connection handler
+async function analyzeSheetData(sheetData, userQuestion) {
+    // Extract relevant data for analysis
+    const merMakeSheet = sheetData['MER MAKE']?.data || [];
+    
+    // Process the data to extract ROAS metrics
+    const processedData = merMakeSheet.map(row => {
+        return {
+            date: row[0],  // Date column
+            metaRoas: parseFloat(row[3]) || 0,  // Meta ROAS column
+            googleRoas: parseFloat(row[5]) || 0  // Google ROAS column
+        };
+    }).filter(row => row.date && (row.metaRoas || row.googleRoas));
+
+    // Create a focused context with the specific metrics
+    const context = `You are an AI analyst specialized in analyzing marketing data.
+    You have access to detailed marketing performance data including:
+    - Meta and Google ROAS trends over time
+    - Daily performance metrics
+    - Campaign effectiveness indicators
+
+    The data shows ROAS (Return on Ad Spend) metrics for both Meta and Google campaigns:
+    ${JSON.stringify(processedData, null, 2)}
+
+    When analyzing ROAS:
+    - Higher ROAS indicates better ad performance
+    - Look for trends and patterns over time
+    - Compare Meta vs Google performance
+    - Identify any significant changes or anomalies
+
+    Please provide a detailed analysis focusing on:
+    1. Clear ROAS trends for both platforms
+    2. Platform comparison and effectiveness
+    3. Specific insights about performance changes
+    4. Data-backed observations
+
+    Format your response in a clear, structured way with specific numbers and trends.`;
+
+    // Call OpenAI API with the focused context
+    const response = await openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [
+            { role: "system", content: context },
+            { role: "user", content: userQuestion }
+        ],
+        temperature: 0.7,
+        max_tokens: 1500
+    });
+
+    return response.choices[0].message.content;
+}
+
+// Update the WebSocket handler
 wss.on('connection', (ws) => {
     console.log('New client connected');
 
@@ -80,45 +150,16 @@ wss.on('connection', (ws) => {
         try {
             const message = JSON.parse(data);
             
-            // If spreadsheet ID is provided, fetch the data
             let sheetData = {};
             if (message.spreadsheetId) {
                 sheetData = await getSheetData(message.spreadsheetId);
+                const analysis = await analyzeSheetData(sheetData, message.content);
+                
+                ws.send(JSON.stringify({
+                    role: 'assistant',
+                    content: analysis
+                }));
             }
-
-            // Prepare context for GPT
-            const context = `You are an AI analyst specialized in analyzing spreadsheet data and providing insights. 
-            You have access to the following spreadsheet data: ${JSON.stringify(sheetData, null, 2)}
-            
-            Please analyze this data and provide insights based on the user's question. 
-            Consider:
-            1. Trends and patterns in the data
-            2. Key metrics and their relationships
-            3. Potential forecasts based on historical data
-            4. Any anomalies or interesting findings
-            
-            Format your response in a clear, structured way with sections for:
-            - Summary of findings
-            - Detailed analysis
-            - Recommendations (if applicable)
-            - Data limitations or caveats`;
-
-            // Call OpenAI API with enhanced context
-            const response = await openai.chat.completions.create({
-                model: "gpt-3.5-turbo",
-                messages: [
-                    { role: "system", content: context },
-                    { role: "user", content: message.content }
-                ],
-                temperature: 0.7,
-                max_tokens: 2000
-            });
-
-            // Send response back to client
-            ws.send(JSON.stringify({
-                role: 'assistant',
-                content: response.choices[0].message.content
-            }));
         } catch (error) {
             console.error('Error:', error);
             ws.send(JSON.stringify({
