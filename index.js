@@ -35,7 +35,7 @@ const openai = new OpenAI({
 });
 
 // Initialize Google Sheets Authentication
-const credentials = JSON.parse(readFileSync('./google-credentials.json'));
+const credentials = JSON.parse(readFileSync('./google-credentials.json')); // read file and convert into json
 const serviceAccountAuth = new JWT({
     email: credentials.client_email,
     key: credentials.private_key,
@@ -46,12 +46,11 @@ async function getSheetData(spreadsheetId) {
     try {
         const doc = new GoogleSpreadsheet(spreadsheetId, serviceAccountAuth);
         await doc.loadInfo();
-        console.log(`Accessed document: ${doc.title}`);
         
         const sheetData = {};
         for (let i = 0; i < doc.sheetCount; i++) {
             const sheet = doc.sheetsByIndex[i];
-            console.log(`Processing sheet: ${sheet.title}`);
+            
             
             // Load all cells in the sheet
             await sheet.loadCells();
